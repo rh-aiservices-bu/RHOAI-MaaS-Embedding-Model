@@ -1,0 +1,36 @@
+---
+# Cluster Observability Operator (COO) — provides the monitoring.rhobs and
+# perses.dev CRDs and the perses-operator that reconciles dashboards.
+#
+# IMPORTANT: COO MUST be installed into the openshift-cluster-observability-operator
+# namespace. The perses-operator generates a NetworkPolicy (perses-operator-access)
+# that only allows the Perses API (port 8080) to be reached from this exact
+# namespace. Installing COO into openshift-operators instead leaves the
+# perses-operator unable to register dashboards (the Observability dashboard then
+# shows "No dashboards found").
+#
+# COO only supports the AllNamespaces install mode, so this uses a global
+# (empty-spec) OperatorGroup in the dedicated namespace.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: openshift-cluster-observability-operator
+---
+apiVersion: operators.coreos.com/v1
+kind: OperatorGroup
+metadata:
+  name: openshift-cluster-observability-operator
+  namespace: openshift-cluster-observability-operator
+spec: {}
+---
+apiVersion: operators.coreos.com/v1alpha1
+kind: Subscription
+metadata:
+  name: cluster-observability-operator
+  namespace: openshift-cluster-observability-operator
+spec:
+  channel: stable
+  name: cluster-observability-operator
+  source: redhat-operators
+  sourceNamespace: openshift-marketplace
+  installPlanApproval: Automatic

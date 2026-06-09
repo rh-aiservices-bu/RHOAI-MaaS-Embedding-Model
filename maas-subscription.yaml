@@ -1,0 +1,47 @@
+---
+# MaaS subscription granting groups token quota for the qwen-3 model, plus a
+# matching authorization policy that grants those groups gateway access.
+#
+# BOTH are required to consume a model: the subscription defines quota/token
+# limits, the authorization policy authorizes gateway access. Without the policy,
+# a valid subscription still yields 403 Forbidden at the gateway.
+#
+# A user is offered a subscription only if one of its groups matches the groups
+# in the caller's auth token. Note that kube:admin is a virtual bootstrap user
+# whose token groups are fixed to [system:cluster-admins, system:authenticated]
+# and does NOT pick up OpenShift Group object membership — which is why
+# system:cluster-admins is listed here so kube:admin can create an API key.
+# For real per-user governance, use regular OpenShift/OIDC users in dedicated
+# groups (e.g. my-model-registry-users) instead of a system group.
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSSubscription
+metadata:
+  name: test-sub
+  namespace: models-as-a-service
+spec:
+  priority: 0
+  owner:
+    groups:
+      - name: my-model-registry-users
+      - name: rhods-admins
+      - name: system:cluster-admins   # lets kube:admin match (see note above)
+  modelRefs:
+    - name: qwen-3
+      namespace: demo-llm
+      tokenRateLimits:
+        - limit: 1000
+          window: 1h
+---
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSAuthPolicy
+metadata:
+  name: test-sub-policy
+  namespace: models-as-a-service
+spec:
+  subjects:
+    groups:
+      - name: my-model-registry-users
+      - name: system:cluster-admins   # must match the subscription for kube:admin
+  modelRefs:
+    - name: qwen-3
+      namespace: demo-llm

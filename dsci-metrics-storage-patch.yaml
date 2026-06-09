@@ -1,0 +1,23 @@
+# Enables the OpenShift AI monitoring stack by configuring metrics storage in
+# the DSCInitialization CR. An empty spec.monitoring.metrics ({}) leaves the
+# observability dashboard with no backend ("Service Unavailable").
+#
+# Setting metrics.storage causes the ODH monitoring service (default-monitoring)
+# to provision a MonitoringStack (Prometheus/Thanos), an OpenTelemetry collector,
+# and Perses in the redhat-ods-monitoring namespace.
+#
+# Requires the Cluster Observability Operator and Red Hat OpenTelemetry operator
+# to be installed first (see cluster-observability-operator.yaml and
+# opentelemetry-operator.yaml).
+#
+# Apply with:
+#   oc patch dscinitialization default-dsci --type=merge \
+#     --patch-file dsci-metrics-storage-patch.yaml
+spec:
+  monitoring:
+    managementState: Managed
+    namespace: redhat-ods-monitoring
+    metrics:
+      storage:
+        retention: 15d
+        size: 5Gi

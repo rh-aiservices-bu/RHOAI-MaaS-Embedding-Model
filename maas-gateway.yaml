@@ -1,0 +1,43 @@
+# NOTE: The GatewayClass "openshift-default" already exists on this cluster
+# (controllerName: openshift.io/gateway-controller/v1) and its spec is
+# immutable, so it is intentionally NOT defined here. The Gateway below
+# references it by name.
+---
+# The MaaS API gateway. Must be named maas-default-gateway and live in the
+# openshift-ingress namespace. The two annotations are required by MaaS:
+#   - opendatahub.io/managed: "false"
+#       Prevents the ODH Model Controller from overriding MaaS-managed
+#       authorization policies.
+#   - security.opendatahub.io/authorino-tls-bootstrap: "true"
+#       Enables TLS communication between the Gateway and Authorino. The MaaS
+#       controller detects this annotation and creates an EnvoyFilter that
+#       configures Envoy to use TLS when talking to Authorino.
+apiVersion: gateway.networking.k8s.io/v1
+kind: Gateway
+metadata:
+  name: maas-default-gateway
+  namespace: openshift-ingress
+  annotations:
+    opendatahub.io/managed: "false"
+    security.opendatahub.io/authorino-tls-bootstrap: "true"
+spec:
+  gatewayClassName: openshift-default
+  listeners:
+    # HTTPS listener terminating TLS for external model endpoints.
+    # Uses the cluster's default ingress wildcard certificate
+    # (cert-manager-ingress-cert in openshift-ingress, per the default
+    # IngressController), which already covers *.apps.<cluster-domain> —
+    # no separate cert secret needed.
+    - name: https
+      protocol: HTTPS
+      port: 443
+      hostname: "maas.apps.cluster-9rcqr.9rcqr.sandbox5187.opentlc.com"
+      allowedRoutes:
+        namespaces:
+          from: All
+      tls:
+        mode: Terminate
+        certificateRefs:
+          - kind: Secret
+            group: ""
+            name: cert-manager-ingress-cert

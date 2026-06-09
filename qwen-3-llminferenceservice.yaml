@@ -1,0 +1,40 @@
+---
+# MaaS-published generative model served via llm-d (LLMInferenceService).
+# Routed through the maas-default-gateway for subscription-based quota enforcement.
+#
+# The tolerations block lets the GPU pods schedule onto nodes carrying the
+# taint nvidia.com/gpu=NVIDIA-L40S-PRIVATE:NoSchedule. Without it the pods stay
+# Pending ("had untolerated taint {nvidia.com/gpu: NVIDIA-L40S-PRIVATE}").
+apiVersion: serving.kserve.io/v1alpha1
+kind: LLMInferenceService
+metadata:
+  name: qwen-3
+  namespace: demo-llm
+spec:
+  model:
+    name: qwen-3
+    uri: hf://Qwen/Qwen3-0.6B
+  replicas: 2
+  router:
+    gateway:
+      refs:
+        - name: maas-default-gateway
+          namespace: openshift-ingress
+    route: {}
+    scheduler: {}
+  template:
+    containers:
+      - name: main
+        resources:
+          limits:
+            cpu: "1"
+            memory: 12Gi
+            nvidia.com/gpu: "1"
+          requests:
+            cpu: "1"
+            memory: 12Gi
+            nvidia.com/gpu: "1"
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule
