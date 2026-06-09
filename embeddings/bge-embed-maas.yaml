@@ -1,0 +1,29 @@
+---
+# Publishes the bge-embed model to MaaS. Equivalent to checking "Publish as MaaS"
+# in the dashboard — the MaaSModelRef registers the LLMInferenceService so it can
+# be added to subscriptions and authorization policies.
+apiVersion: maas.opendatahub.io/v1alpha1
+kind: MaaSModelRef
+metadata:
+  name: bge-embed
+  namespace: demo-llm
+spec:
+  modelRef:
+    kind: LLMInferenceService
+    name: bge-embed
+# ---------------------------------------------------------------------------
+# bge-embed must also be added to a subscription (quota) and an authorization
+# policy (gateway access). These live in ../maas-subscription.yaml; add the
+# following entries there (already applied on this cluster):
+#
+#   MaaSSubscription test-sub  -> spec.modelRefs:
+#     - name: bge-embed
+#       namespace: demo-llm
+#       tokenRateLimits:
+#         - limit: 5000      # embeddings consume only input tokens
+#           window: 1h
+#
+#   MaaSAuthPolicy test-sub-policy -> spec.modelRefs:
+#     - name: bge-embed
+#       namespace: demo-llm
+# ---------------------------------------------------------------------------

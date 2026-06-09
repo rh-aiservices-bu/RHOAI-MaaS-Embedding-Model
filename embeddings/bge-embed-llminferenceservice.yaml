@@ -1,0 +1,44 @@
+---
+# Embedding model served via vLLM (NOT llm-d) and published through MaaS.
+# Differences from the llm-d qwen-3 service:
+#   - router has NO `scheduler:` block -> no InferencePool/EPP (which is
+#     generation-only). The aim is a plain vLLM pod behind a simple route that
+#     forwards /v1/embeddings.
+#   - container args set the vLLM task to embeddings.
+apiVersion: serving.kserve.io/v1alpha1
+kind: LLMInferenceService
+metadata:
+  name: bge-embed
+  namespace: demo-llm
+spec:
+  model:
+    name: bge-embed
+    uri: hf://BAAI/bge-base-en-v1.5
+  replicas: 1
+  router:
+    gateway:
+      refs:
+        - name: maas-default-gateway
+          namespace: openshift-ingress
+    route: {}
+    # no scheduler: => attempt plain vLLM routing (no llm-d InferencePool)
+  template:
+    containers:
+      - name: main
+        # vLLM 0.18 removed --task; use --runner pooling for embedding models.
+        # (For bge, vLLM would auto-detect pooling, but we set it explicitly.)
+        # The base template appends these to `vllm serve ... $@`.
+        args: ["--runner", "pooling"]
+        resources:
+          limits:
+            cpu: "1"
+            memory: 8Gi
+            nvidia.com/gpu: "1"
+          requests:
+            cpu: "1"
+            memory: 8Gi
+            nvidia.com/gpu: "1"
+    tolerations:
+      - key: nvidia.com/gpu
+        operator: Exists
+        effect: NoSchedule

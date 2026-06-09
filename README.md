@@ -25,6 +25,7 @@ Models-as-a-Service* (OpenShift AI 3.4 docs).
 | `dsci-metrics-storage-patch.yaml` | Enables the monitoring stack by setting `metrics.storage` in DSCInitialization |
 | `qwen-3-llminferenceservice.yaml` | Example MaaS model (`qwen-3`) served via llm-d, including the GPU toleration fix |
 | `maas-subscription.yaml` | Example MaaS subscription + matching authorization policy granting quota/access for `qwen-3` |
+| `embeddings/` | Serving an **embedding** model on MaaS via plain vLLM (llm-d can't route `/v1/embeddings`) — see `embeddings/README.md` |
 
 ---
 
