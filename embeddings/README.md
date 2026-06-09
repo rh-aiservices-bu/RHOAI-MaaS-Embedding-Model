@@ -66,6 +66,45 @@ Expect a `200` with `data[].embedding` vectors (dim 768 for bge-base) and a
 `usage.prompt_tokens` count — confirming auth, routing, serving, and token
 metering all work under MaaS.
 
+## Rate limiting
+
+The subscription gives `bge-embed` a budget of **5000 tokens / 1h**. Sending a
+burst of embedding requests (each batching 4 inputs ≈ 488 input tokens) shows the
+limit enforced at the gateway:
+
+```text
+req  1: HTTP 200  tokens=488  cumulative=488
+...
+req 11: HTTP 200  tokens=488  cumulative=5368
+req 12: HTTP 429  >> Too Many Requests
+```
+
+The limiter allows every request up to and including the one that crosses 5000
+(req 11 landed at 5368), then returns **429** for the rest until the 1-hour
+sliding window rolls off. Notes:
+
+- **Per-model budgets are independent** — this 5000/1h is separate from qwen-3's
+  1000/1h; exhausting one does not affect the other.
+- **Embeddings meter input tokens** (`prompt_tokens`); there are no completion
+  tokens.
+- **Enforced by Kuadrant/Limitador before vLLM runs**, so 429s cost no GPU
+  compute and increment `limited_calls` in the observability metrics.
+
+Reproduce with a short loop:
+
+```bash
+BASE="https://maas.apps.<domain>/demo-llm/bge-embed"; KEY="<API_KEY>"
+TEXT=$(printf 'models as a service governs large language model access %.0s' {1..12})
+for i in $(seq 1 12); do
+  curl -sS -o /dev/null -w "req $i: %{http_code}\n" \
+    -H "Authorization: Bearer $KEY" -H "Content-Type: application/json" \
+    "$BASE/v1/embeddings" -d "{\"model\":\"bge-embed\",\"input\":[\"$TEXT\",\"$TEXT\",\"$TEXT\",\"$TEXT\"]}"
+done
+```
+
+(Invalid key → **403**, missing/malformed `Authorization` → **401**, both rejected
+at the gateway before reaching vLLM.)
+
 ## Rule of thumb
 
 - **Generative chat models** → llm-d (`router.scheduler: {}`).
