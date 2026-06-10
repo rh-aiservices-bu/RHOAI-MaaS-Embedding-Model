@@ -1,349 +1,316 @@
-# Models-as-a-Service (MaaS) Setup — OpenShift AI 3.4
+# Deploy RHOAI 3.4 + Models-as-a-Service (MaaS) on a fresh OCP 4.20 cluster
 
-Configuration manifests and steps for deploying and enabling Models-as-a-Service
-(MaaS) on Red Hat OpenShift AI Self-Managed 3.4, including the PostgreSQL
-backend, API gateway, Authorino TLS, and the observability/monitoring stack.
+End-to-end `oc` walkthrough to stand up Red Hat OpenShift AI 3.4 and
+Models-as-a-Service on a clean OpenShift 4.20 cluster, then publish models
+(generative via llm-d, embeddings via vLLM), govern them with
+subscriptions/quotas, and enable the observability dashboard.
 
 Reference: *Govern LLM access with Models-as-a-Service → Deploy and manage
 Models-as-a-Service* (OpenShift AI 3.4 docs).
 
-## Cluster details
+## Assumptions / starting point
 
-- Apps domain: `apps.cluster-9rcqr.9rcqr.sandbox5187.opentlc.com`
-- Default ingress cert secret: `cert-manager-ingress-cert` (in `openshift-ingress`)
+- **OpenShift 4.20** (4.19.9+), cluster-admin, `oc` installed.
+- **NVIDIA GPU Operator + NFD already installed** (this guide does not cover
+  them). GPU nodes here carry the taint `nvidia.com/gpu=NVIDIA-L40S-PRIVATE:NoSchedule`,
+  so model pods need a matching toleration (handled in the model manifests).
+- A functional ingress controller with a valid default wildcard cert. Find its
+  secret name with:
+  ```bash
+  oc get ingresscontroller default -n openshift-ingress-operator \
+    -o jsonpath='{.spec.defaultCertificate.name}{"\n"}'   # e.g. cert-manager-ingress-cert
+  ```
 
-## Files
+> **Per-cluster values to edit before applying:** the apps domain in
+> `maas-gateway.yaml` (the `hostname:`), the default cert secret name if it
+> differs, and the PostgreSQL password in `postgres-deployment.yaml` +
+> `maas-db-config-secret.yaml` (must match).
 
-| File | Purpose |
-|------|---------|
-| `postgres-deployment.yaml` | Self-managed PostgreSQL 16 instance (namespace, credentials, PVC, Deployment, Service) backing MaaS API-key management |
-| `maas-db-config-secret.yaml` | `maas-db-config` secret in `redhat-ods-applications` with the PostgreSQL `DB_CONNECTION_URL` |
-| `maas-gateway.yaml` | `maas-default-gateway` Gateway in `openshift-ingress` with the required MaaS annotations |
-| `configure-maas-tls.sh` | Configures TLS between Authorino and the MaaS API gateway |
-| `cluster-observability-operator.yaml` | Subscription for the Cluster Observability Operator (COO) |
-| `opentelemetry-operator.yaml` | Subscription for the Red Hat build of OpenTelemetry (required by the ODH monitoring service) |
-| `dsci-metrics-storage-patch.yaml` | Enables the monitoring stack by setting `metrics.storage` in DSCInitialization |
-| `qwen-3-llminferenceservice.yaml` | Example MaaS model (`qwen-3`) served via llm-d, including the GPU toleration fix |
-| `maas-subscription.yaml` | Example MaaS subscription + matching authorization policy granting quota/access for `qwen-3` |
-| `embeddings/` | Serving an **embedding** model on MaaS via plain vLLM (llm-d can't route `/v1/embeddings`) — see `embeddings/README.md` |
+## Ordering dependency (important)
+
+The DSC `modelsAsService` component will **not** become Ready until three things
+exist, and it reports exactly which are missing in its status:
+
+1. `maas-default-gateway` Gateway in `openshift-ingress`
+2. `maas-db-config` Secret in `redhat-ods-applications` (created after the DSC
+   makes that namespace)
+3. Authorino TLS enabled
+
+So the flow is: install operators → Kuadrant CR → **apply the DSC** (it starts
+reconciling and creates `redhat-ods-applications`, then waits) → create the
+gateway, DB secret, and Authorino TLS to unblock it.
+
+> **Restart the Kuadrant operator after the DSC settles.** The Connectivity Link
+> (Kuadrant) operator is installed early, but its required dependencies —
+> Service Mesh 3 (Istio, the Gateway API provider) and the Limitador operator —
+> are installed later by the RHOAI DSC reconcile. The Kuadrant operator caches
+> "dependencies missing" at startup, so its AuthPolicy / TokenRateLimitPolicy
+> CRs never get **Enforced** and **models are served with no auth (HTTP 200
+> without a key)**. After the DSC is Ready, restart it (see Phase 5 / Troubleshooting).
 
 ---
 
-## Steps
+## Files
 
-### 1. Deploy PostgreSQL and create the database secret
+Foundation (cluster-setup/, apply in order):
 
-OpenShift AI does not provide a database. MaaS requires a PostgreSQL instance
-(version 14+) reachable from the cluster for API-key lifecycle management.
+| File | Purpose |
+|------|---------|
+| `cluster-setup/01-user-workload-monitoring.yaml` | Enables User Workload Monitoring (required, else MaaS is Degraded) |
+| `cluster-setup/02-rhoai-operator.yaml` | RHOAI operator, channel `stable-3.4` (`redhat-ods-operator` ns) |
+| `cluster-setup/03-connectivity-link-operator.yaml` | Red Hat Connectivity Link / Kuadrant operator (`rhcl-operator`) |
+| `cluster-setup/04-kuadrant.yaml` | Kuadrant CR (Authorino + Limitador) with observability enabled |
+| `cluster-setup/05-datasciencecluster.yaml` | DataScienceCluster: kserve + modelsAsService + dashboard + llamastack |
 
-> **Before applying:** replace the placeholder password `ChangeMe-StrongPassword`
-> in **both** `postgres-deployment.yaml` and `maas-db-config-secret.yaml` (they
-> must match).
+MaaS configuration (root):
+
+| File | Purpose |
+|------|---------|
+| `maas-gateway.yaml` | `maas-default-gateway` + a `maas-gateway-class` GatewayClass |
+| `postgres-deployment.yaml` | Self-managed PostgreSQL 16 (API-key store) |
+| `maas-db-config-secret.yaml` | `maas-db-config` secret with the PostgreSQL `DB_CONNECTION_URL` |
+| `configure-maas-tls.sh` | Configures TLS between Authorino and the MaaS gateway |
+| `cluster-observability-operator.yaml` | Cluster Observability Operator (in its own namespace — see note) |
+| `opentelemetry-operator.yaml` | Red Hat OpenTelemetry operator (required by the ODH monitoring service) |
+| `dsci-metrics-storage-patch.yaml` | Sets `metrics.storage` in DSCInitialization to provision the monitoring stack |
+| `qwen-3-llminferenceservice.yaml` | Example generative model (llm-d) with GPU toleration |
+| `maas-subscription.yaml` | Example subscription + authorization policy |
+| `embeddings/` | Serving an **embedding** model via plain vLLM (llm-d can't route `/v1/embeddings`) — see `embeddings/README.md` |
+
+---
+
+## Phase 1 — Cluster foundation
+
+### 1. User Workload Monitoring + operators
 
 ```bash
-oc apply -f postgres-deployment.yaml
-oc apply -f maas-db-config-secret.yaml
+oc apply -f cluster-setup/01-user-workload-monitoring.yaml
+oc apply -f cluster-setup/02-rhoai-operator.yaml
+oc apply -f cluster-setup/03-connectivity-link-operator.yaml
 ```
 
-Verify:
+Wait for both operators to reach `Succeeded` (approve InstallPlans if the cluster
+defaults to manual approval):
 
 ```bash
+oc get csv -n redhat-ods-operator | grep rhods-operator
+oc get csv -n openshift-operators | grep -i rhcl
+```
+
+### 2. Kuadrant CR
+
+```bash
+oc apply -f cluster-setup/04-kuadrant.yaml      # creates kuadrant-system, deploys Authorino + Limitador
+```
+
+### 3. DataScienceCluster
+
+The RHOAI operator auto-creates a `default-dsci` (DSCInitialization). Apply the DSC:
+
+```bash
+oc apply -f cluster-setup/05-datasciencecluster.yaml
+oc get datasciencecluster default-dsc -o jsonpath='{.status.phase}{"\n"}'
+```
+
+It will sit at `Not Ready` with `ModelsAsServiceReady=False` until the gateway,
+DB secret, and Authorino TLS are in place (Phase 2). That's expected.
+
+---
+
+## Phase 2 — MaaS prerequisites (unblock the DSC)
+
+### 4. MaaS gateway
+
+```bash
+oc apply -f maas-gateway.yaml      # edit hostname/cert secret first
+oc get gateway maas-default-gateway -n openshift-ingress \
+  -o jsonpath='Programmed={.status.conditions[?(@.type=="Programmed")].status}{"\n"}'
+```
+
+> If a GatewayClass with controller `openshift.io/gateway-controller/v1` already
+> exists (e.g. `openshift-default` or `data-science-gateway-class`), you can
+> reference it and drop the GatewayClass block from the manifest.
+
+### 5. PostgreSQL + database secret
+
+```bash
+oc apply -f postgres-deployment.yaml      # set the password first
+# redhat-ods-applications now exists (created by the DSC); create the secret there:
+oc apply -f maas-db-config-secret.yaml
 oc get secret maas-db-config -n redhat-ods-applications
 ```
 
-**Note on `sslmode`:** `maas-db-config-secret.yaml` uses `sslmode=disable` because
-the in-cluster `rhel9/postgresql` image is not configured for TLS. If you front
-the DB with TLS or use an external managed PostgreSQL, change this to
-`sslmode=require`.
+`maas-db-config-secret.yaml` uses `sslmode=disable` (the in-cluster image has no
+TLS); use `sslmode=require` for an external/TLS-fronted database.
 
-If MaaS (`modelsAsService`) is already `Managed` when you create/update the
-secret, restart the API to pick it up:
-
-```bash
-oc rollout restart deployment/maas-api -n redhat-ods-applications
-```
-
-### 2. Create the MaaS gateway
-
-The Gateway must be named `maas-default-gateway`, live in `openshift-ingress`,
-and carry both annotations:
-
-- `opendatahub.io/managed: "false"` — prevents the ODH Model Controller from
-  overriding MaaS-managed authorization policies.
-- `security.opendatahub.io/authorino-tls-bootstrap: "true"` — enables TLS to
-  Authorino (the MaaS controller creates an EnvoyFilter for this).
-
-The listener uses the cluster's default ingress wildcard cert
-(`cert-manager-ingress-cert`), which covers the `maas.apps.<domain>` hostname —
-no separate cert secret is needed.
-
-> The `openshift-default` GatewayClass (controller
-> `openshift.io/gateway-controller/v1`) already exists on this cluster and is
-> immutable, so it is **not** defined in the manifest — the Gateway references it
-> by name.
-
-```bash
-oc apply -f maas-gateway.yaml
-```
-
-Verify the Gateway is accepted and programmed:
-
-```bash
-oc get gateway maas-default-gateway -n openshift-ingress \
-  -o jsonpath='Accepted={.status.conditions[?(@.type=="Accepted")].status} Programmed={.status.conditions[?(@.type=="Programmed")].status}{"\n"}'
-```
-
-### 3. Configure TLS for Authorino and the MaaS API gateway
-
-Runs the four steps from *Configure TLS for Models-as-a-Service*: annotate the
-Authorino service for a serving cert, enable the Authorino TLS listener, set the
-service-CA bundle env vars, and (idempotently) re-apply the Gateway
-TLS-bootstrap annotation.
+### 6. Authorino TLS
 
 ```bash
 bash configure-maas-tls.sh
 oc rollout status deployment/authorino -n kuadrant-system
 ```
 
+### 7. Confirm MaaS is Ready
+
+```bash
+oc get datasciencecluster default-dsc \
+  -o jsonpath='ModelsAsServiceReady={.status.conditions[?(@.type=="ModelsAsServiceReady")].status}{"\n"}'
+oc get deploy maas-api -n redhat-ods-applications
+oc get tenants.maas.opendatahub.io -n models-as-a-service   # default-tenant -> READY True
+```
+
+---
+
+## Phase 3 — Dashboard flags
+
+```bash
+oc patch OdhDashboardConfig odh-dashboard-config -n redhat-ods-applications --type=merge -p '{
+  "spec":{"dashboardConfig":{
+    "modelAsService": true,
+    "maasAuthPolicies": true,
+    "genAiStudio": true,
+    "observabilityDashboard": true,
+    "vLLMDeploymentOnMaaS": true
+  }}}'
+```
+
+- `modelAsService` — MaaS publishing in the deploy wizard
+- `maasAuthPolicies` — MaaS admin (Subscriptions/Authorization policies) pages
+- `genAiStudio` — Gen AI Studio (needs `llamastackoperator: Managed`)
+- `observabilityDashboard` — the Observe & Monitor dashboard
+- `vLLMDeploymentOnMaaS` — Tech Preview vLLM runtime option (needed for embeddings)
+
+---
+
+## Phase 4 — Observability (Observe & Monitor dashboard)
+
+The dashboard's observability page needs a monitoring backend. Dependency chain:
+
+```bash
+# 4a. Cluster Observability Operator — MUST be in its own namespace (see note)
+oc apply -f cluster-observability-operator.yaml
+# 4b. Red Hat OpenTelemetry operator (the ODH monitoring service requires it)
+oc apply -f opentelemetry-operator.yaml
+# (approve InstallPlans if manual; wait for both CSVs to Succeed)
+
+# 4c. Provision the monitoring stack
+oc patch dscinitialization default-dsci --type=merge --patch-file dsci-metrics-storage-patch.yaml
+
+# 4d. Tenant telemetry (Kuadrant observability is already on from the Kuadrant CR)
+oc patch tenants.maas.opendatahub.io default-tenant -n models-as-a-service --type=merge -p '{
+  "spec":{"telemetry":{"enabled":true,"metrics":{"captureOrganization":true,"captureUser":false,"captureGroup":false,"captureModelUsage":true}}}}'
+```
+
+> **COO namespace matters.** `cluster-observability-operator.yaml` installs COO
+> into `openshift-cluster-observability-operator`. Its perses-operator generates
+> a NetworkPolicy that only allows the Perses API from that exact namespace —
+> installing COO into `openshift-operators` leaves the Observability dashboard
+> showing **"No dashboards found"** even though the pods are healthy.
+
 Verify:
 
 ```bash
-oc get secret authorino-server-cert -n kuadrant-system
-oc get authorino authorino -n kuadrant-system -o jsonpath='{.spec.listener.tls.enabled}{"\n"}'
+oc get monitoring default-monitoring -o jsonpath='Ready={.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+oc get pods -n redhat-ods-monitoring        # Perses, Prometheus, Thanos, OTel collector, Alertmanager
+oc get persesdashboard -A                   # each should be Available=True
 ```
 
-### 4. Enable observability / the Observe & Monitor dashboard
+---
 
-The dashboard's observability page requires a backend monitoring stack. Enabling
-it has a dependency chain that must be satisfied in order:
+## Phase 5 — Deploy models, subscriptions, and test
 
-#### 4a. Install the Cluster Observability Operator (COO)
-
-> **Namespace matters.** COO **must** be installed into the
-> `openshift-cluster-observability-operator` namespace (the manifest creates it
-> along with an OperatorGroup). The perses-operator it ships generates a
-> NetworkPolicy that only allows the Perses API to be reached from that exact
-> namespace. Installing COO into `openshift-operators` instead leaves the
-> perses-operator unable to register dashboards, and the Observability dashboard
-> shows **"No dashboards found"** even though the backend pods are healthy.
-
-```bash
-oc apply -f cluster-observability-operator.yaml
-```
-
-If the InstallPlan requires manual approval (this cluster defaults to manual),
-approve it:
-
-```bash
-oc get installplan -n openshift-cluster-observability-operator   # find the pending plan
-oc patch installplan <name> -n openshift-cluster-observability-operator \
-  --type=merge -p '{"spec":{"approved":true}}'
-```
-
-Wait for the CSV to reach `Succeeded` and the `monitoring.rhobs` CRDs to appear.
-
-#### 4b. Install the Red Hat OpenTelemetry operator
-
-The ODH monitoring service requires the `OpenTelemetryCollector` operator —
-without it, `default-monitoring` stays in `Error`
-(`OpenTelemetryCollector operator must be installed`).
-
-```bash
-oc apply -f opentelemetry-operator.yaml
-```
-
-(Approve the InstallPlan the same way if it is manual.)
-
-#### 4c. Configure metrics storage in DSCInitialization
-
-`spec.monitoring.metrics` was empty (`{}`), so no MonitoringStack was provisioned.
-This patch sets storage and triggers the full stack:
-
-```bash
-oc patch dscinitialization default-dsci --type=merge \
-  --patch-file dsci-metrics-storage-patch.yaml
-```
-
-#### 4d. Kuadrant observability and Tenant telemetry
-
-These were already enabled on this cluster; verify:
-
-```bash
-oc get kuadrant kuadrant -n kuadrant-system -o jsonpath='{.spec.observability.enable}{"\n"}'
-oc get tenants.maas.opendatahub.io default-tenant -n models-as-a-service \
-  -o jsonpath='{.spec.telemetry.enabled}{"\n"}'
-```
-
-If either is missing, enable it:
-
-```bash
-oc patch kuadrant kuadrant -n kuadrant-system --type=merge \
-  -p '{"spec":{"observability":{"enable":true}}}'
-oc patch tenants.maas.opendatahub.io default-tenant -n models-as-a-service --type=merge \
-  -p '{"spec":{"telemetry":{"enabled":true}}}'
-```
-
-#### Verify the monitoring stack
-
-```bash
-oc get monitoring default-monitoring \
-  -o jsonpath='Ready={.status.conditions[?(@.type=="Ready")].status}{"\n"}'
-oc get pods -n redhat-ods-monitoring
-```
-
-Expect `Ready=True` and all pods Running (Perses, Prometheus, Thanos Querier,
-OpenTelemetry collector, Alertmanager).
-
-Also confirm the Perses dashboards have registered (this is what the UI lists —
-if they are not `Available`, the dashboard shows "No dashboards found"):
-
-```bash
-oc get persesdashboard -A
-oc get persesdashboard dashboard-3-maas-usage-admin -n redhat-ods-applications \
-  -o jsonpath='Available={.status.conditions[?(@.type=="Available")].status}{"\n"}'
-```
-
-Expect `Available=True` for each dashboard, including the MaaS usage dashboard
-(`dashboard-3-maas-usage-admin`). Then hard-refresh the OpenShift AI dashboard
-and reopen the Observe/Monitor page.
-
-> **Note:** `Tempo`/tracing and alerting conditions remain `False` because
-> traces/alerting are not configured in the DSCI. These are optional and not
-> required for MaaS usage metrics (token consumption, request counts, rate
-> limits).
-
-### 5. Deploy and publish a model (llm-d)
-
-Deploy a generative model via the dashboard wizard as a **Generative AI model**
-with **Distributed inference with llm-d** (leave *Use legacy deployment method*
-unchecked), and select **Publish as MaaS** under Advanced settings. Only the
-llm-d / LLMInferenceService path exposes the "Publish as MaaS" option — the
-standard KServe path shows "Publish as AI asset endpoint" instead.
-
-`qwen-3-llminferenceservice.yaml` is the resulting resource for the example
-model, with one important addition: a **GPU toleration**. The GPU nodes carry the
-taint `nvidia.com/gpu=NVIDIA-L40S-PRIVATE:NoSchedule`, so without a toleration
-the pods stay `Pending` (`0/N nodes available: had untolerated taint ...`). The
-toleration lives on `spec.template.tolerations`:
-
-```yaml
-spec:
-  template:
-    tolerations:
-      - key: nvidia.com/gpu
-        operator: Exists
-        effect: NoSchedule
-```
+- **Generative model (llm-d):** `qwen-3-llminferenceservice.yaml` — deploy as a
+  Generative AI model via llm-d (GPU toleration included). Each replica needs a GPU.
+- **Subscription + auth policy:** `maas-subscription.yaml` — quota + gateway
+  access (both required to consume a model).
+- **Embedding model (vLLM):** see `embeddings/` — llm-d can't route
+  `/v1/embeddings`; deploy plain vLLM (no `router.scheduler`, `--runner pooling`).
 
 ```bash
 oc apply -f qwen-3-llminferenceservice.yaml
-oc get llminferenceservice qwen-3 -n demo-llm \
-  -o jsonpath='Ready={.status.conditions[?(@.type=="Ready")].status}{"\n"}'
-```
-
-Each replica consumes one GPU. With 2 replicas on 2 single-GPU nodes the model
-uses all GPU capacity, so other GPU workloads will go `Pending`.
-
-### 6. Create a subscription and authorization policy
-
-A model is only consumable once a **subscription** (quota) and a matching
-**authorization policy** (gateway access) reference it. You can create these in
-the dashboard, or apply `maas-subscription.yaml`:
-
-```bash
 oc apply -f maas-subscription.yaml
-oc get maassubscription,maasauthpolicy -n models-as-a-service
 ```
 
-Both should reach `Active`. A user is offered a subscription only if one of its
-groups matches the groups in their auth token — see the kube:admin note in
-Troubleshooting.
-
-Test end to end with an API key created from the dashboard:
+**Then restart the Kuadrant operator** so it picks up Service Mesh + Limitador and
+actually enforces the generated policies (otherwise the model is open — 200 with
+no key, and the subscription/auth-policy show `Degraded`):
 
 ```bash
+oc delete pod -n openshift-operators -l control-plane=controller-manager   # restarts kuadrant/limitador operators
+# wait for: kuadrant Ready=True and the AuthPolicy Enforced=True
+oc get kuadrant kuadrant -n kuadrant-system -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}{"\n"}'
+oc get maassubscription,maasauthpolicy -n models-as-a-service     # both -> Active
+```
+
+```bash
+# create an API key from the dashboard, then:
 BASE="https://maas.apps.<domain>/demo-llm/qwen-3"
-curl -sS -H "Authorization: Bearer <API_KEY>" "$BASE/v1/models"
 curl -sS -H "Authorization: Bearer <API_KEY>" -H "Content-Type: application/json" \
   "$BASE/v1/chat/completions" \
   -d '{"model":"qwen-3","messages":[{"role":"user","content":"hello"}],"max_tokens":32}'
 ```
 
-A `200` with a token-usage block confirms the full path (key auth → subscription
-quota → auth policy → llm-d serving) works.
+Access control behaves as: invalid key → **403**, missing/malformed auth → **401**,
+token budget exhausted → **429** (all enforced at the gateway before the model runs).
+Verified on this cluster: `no key → 401`, `invalid key → 403` once the Kuadrant
+operator was restarted (see below).
 
 ---
 
 ## Troubleshooting
 
-Issues hit during this setup and how they were resolved:
-
-- **Observability dashboard: "Service Unavailable"** — the monitoring backend
-  didn't exist. Install COO + OpenTelemetry and set `metrics.storage` (Step 4).
-
-- **Observability dashboard: "No dashboards found"** — COO was installed in
-  `openshift-operators`; its perses-operator NetworkPolicy only allows access
-  from `openshift-cluster-observability-operator`. Reinstall COO into that
-  namespace (Step 4a).
-
+- **DSC stuck `ModelsAsServiceReady=False`** — read its message; it names exactly
+  what's missing (gateway / `maas-db-config` secret / Authorino TLS). Create them.
+- **Model served with no auth (200 without a key); subscription/auth-policy
+  `Degraded`** — the Kuadrant operator started before its deps (Service Mesh 3 /
+  Istio + Limitador operator) were installed by the DSC, so it cached
+  `MissingDependency` and never enforced its AuthPolicy/TokenRateLimitPolicy.
+  Restart it (deps are already present):
+  ```bash
+  oc delete pod -n openshift-operators -l control-plane=controller-manager
+  # Kuadrant -> Ready=True, AuthPolicy -> Enforced=True, model -> 401/403 without a valid key
+  ```
+- **Observability "Service Unavailable"** — monitoring backend not installed
+  (Phase 4: COO + OTel + `metrics.storage`).
+- **Observability "No dashboards found"** — COO installed in the wrong namespace
+  (must be `openshift-cluster-observability-operator`).
 - **MaaS usage dashboard stuck (Perses HTTP 500)** — a corrupt Perses project
-  file (`/perses/projects/redhat-ods-applications.yaml` with a stray trailing
-  line) made `GET /api/v1/projects` return 500, blocking dashboard registration.
-  Fix by truncating the file to valid YAML inside the Perses pod:
-
+  file makes `GET /api/v1/projects` 500. Fix inside the Perses pod:
   ```bash
   oc exec -n redhat-ods-monitoring data-science-perses-0 -- sh -c \
     'head -n 9 /perses/projects/redhat-ods-applications.yaml > /tmp/f && \
      cp /tmp/f /perses/projects/redhat-ods-applications.yaml'
   ```
-  This is a runtime fix (not a manifest); it recurs only if the file is
-  regenerated corrupt.
-
-- **Model pods `Pending` — untolerated GPU taint** — add the GPU toleration to
-  the LLMInferenceService (Step 5).
-
-- **LLMInferenceService `GatewayPreconditionNotMet` ("AuthPolicy CRD is not
-  available")** even though Connectivity Link/Kuadrant is installed — the KServe
-  controllers started before the AuthPolicy CRD existed, so their discovery
-  caches were stale. Restart them:
-
+- **Model pods `Pending` — untolerated GPU taint** — add the `nvidia.com/gpu`
+  toleration (in the model manifests).
+- **LLMInferenceService `GatewayPreconditionNotMet` ("AuthPolicy CRD not
+  available")** even though Kuadrant is installed — KServe controllers cached CRD
+  discovery before the CRD existed; restart them:
   ```bash
   oc rollout restart deployment/llmisvc-controller-manager -n redhat-ods-applications
   oc rollout restart deployment/kserve-controller-manager  -n redhat-ods-applications
   ```
-
-- **Can't see a subscription when creating an API key as kube:admin** —
-  `kube:admin` is a virtual user whose token groups are fixed to
-  `[system:cluster-admins, system:authenticated]`; it never picks up OpenShift
-  `Group` object membership. Either add `system:cluster-admins` to the
-  subscription **and** auth policy (as in `maas-subscription.yaml`), or create a
-  real OpenShift/OIDC user in a dedicated group. The cluster had no IDP/users, so
-  `system:cluster-admins` was used here for testing.
+- **kube:admin can't see a subscription when creating an API key** — kube:admin's
+  token groups are fixed to `[system:cluster-admins, system:authenticated]` and it
+  ignores OpenShift `Group` membership. Add `system:cluster-admins` to the
+  subscription + auth policy, or use a real OpenShift/OIDC user.
 
 ---
 
-## Status
+## Verified state on this cluster (OCP 4.20.23)
 
 | Component | State |
 |-----------|-------|
-| PostgreSQL + `maas-db-config` secret | Manifests ready (set password before applying) |
-| `maas-default-gateway` | Applied — Accepted & Programmed |
-| Authorino + gateway TLS | Configured & verified |
-| Cluster Observability Operator | Installed |
-| Red Hat OpenTelemetry operator | Installed |
-| DSCInitialization metrics storage | Configured (15d / 5Gi) |
-| Kuadrant observability | Enabled |
-| Tenant telemetry | Enabled |
+| RHOAI 3.4 operator + Connectivity Link | Installed (Succeeded) |
+| DataScienceCluster `default-dsc` | Ready |
+| Kuadrant (Authorino + Limitador) | Deployed, observability enabled |
+| `maas-default-gateway` | Programmed |
+| PostgreSQL + `maas-db-config` | Running / created |
+| Authorino TLS | Enabled |
+| `maas-api` + Tenant `default-tenant` | 1/1 / Ready (Reconciled) |
+| Dashboard flags | modelAsService, maasAuthPolicies, genAiStudio, observabilityDashboard, vLLMDeploymentOnMaaS |
+| COO + OpenTelemetry + metrics storage | Installed |
 | `default-monitoring` MonitoringStack | Ready — 9/9 pods Running |
-| Perses dashboards (incl. MaaS usage) | All `Available` (after corrupt-project-file fix) |
 | Example model `qwen-3` (llm-d) | Ready — 2 replicas on GPU nodes |
-| Subscription `test-sub` + policy `test-sub-policy` | Active |
-| End-to-end inference with API key | Verified (200 + token usage) |
-
-### Not covered here (verify separately)
-
-DataScienceCluster `kserve: Managed` and `kserve.modelsAsService.managementState: Managed`,
-dashboard flags (`modelAsService`, `maasAuthPolicies`, `genAiStudio`,
-`observabilityDashboard`), User Workload Monitoring, and llm-d / Connectivity Link
-(Kuadrant) install — all confirmed present on this cluster but not managed by
-these manifests.
+| Subscription `test-sub` + policy `test-sub-policy` | Active (after Kuadrant operator restart) |
+| Gateway auth enforcement | Verified — no key → 401, invalid key → 403 |

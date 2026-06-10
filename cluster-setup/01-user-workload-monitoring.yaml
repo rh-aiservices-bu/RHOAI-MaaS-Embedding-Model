@@ -1,0 +1,12 @@
+---
+# Enables User Workload Monitoring (UWM). MaaS requires UWM to collect token
+# usage, request counts, and rate-limit metrics; without it the MaaS install
+# reports Degraded. This ConfigMap is the cluster-wide monitoring switch.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: cluster-monitoring-config
+  namespace: openshift-monitoring
+data:
+  config.yaml: |
+    enableUserWorkload: true

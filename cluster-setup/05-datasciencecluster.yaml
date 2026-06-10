@@ -1,0 +1,38 @@
+---
+# DataScienceCluster enabling the components MaaS needs:
+#   - kserve Managed + modelsAsService Managed  -> the MaaS control plane (maas-api,
+#     MaaS CRDs, Tenant) and llm-d/LLMInferenceService serving
+#   - dashboard Managed                          -> OpenShift AI dashboard
+#   - llamastackoperator Managed                 -> Gen AI Studio user-facing features
+#
+# Other components are left Removed to keep the install lean; enable more as needed.
+apiVersion: datasciencecluster.opendatahub.io/v2
+kind: DataScienceCluster
+metadata:
+  name: default-dsc
+spec:
+  components:
+    dashboard:
+      managementState: Managed
+    kserve:
+      managementState: Managed
+      modelsAsService:
+        managementState: Managed
+    llamastackoperator:
+      managementState: Managed
+    workbenches:
+      managementState: Removed
+    modelregistry:
+      managementState: Removed
+    datasciencepipelines:
+      managementState: Removed
+    kueue:
+      managementState: Removed
+    ray:
+      managementState: Removed
+    trainingoperator:
+      managementState: Removed
+    trustyai:
+      managementState: Removed
+    feastoperator:
+      managementState: Removed

@@ -1,0 +1,18 @@
+---
+# Kuadrant instance for the Connectivity Link operator. Deploys Authorino
+# (auth) and Limitador (rate limiting) into kuadrant-system — the engine behind
+# MaaS API-key auth and token rate limits. observability.enable wires Kuadrant
+# metrics (incl. Limitador) into Prometheus for the MaaS usage dashboard.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: kuadrant-system
+---
+apiVersion: kuadrant.io/v1beta1
+kind: Kuadrant
+metadata:
+  name: kuadrant
+  namespace: kuadrant-system
+spec:
+  observability:
+    enable: true
